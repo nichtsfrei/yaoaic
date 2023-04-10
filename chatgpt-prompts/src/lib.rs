@@ -11,6 +11,7 @@ use std::fmt::Display;
 use hyper::{body::Bytes, http, Body, Client, Request};
 use hyper_tls::HttpsConnector;
 use serde::{Deserialize, Serialize};
+use tokio::{fs::File, io::AsyncReadExt};
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum Source<'a> {
@@ -67,23 +68,45 @@ impl From<hyper::Error> for Error {
 }
 pub struct PromptLoader {}
 
-impl PromptLoader {
-    fn parse_bytes(b: &[u8]) -> Vec<Result<Prompt>> {
-        let mut cr = csv::Reader::from_reader(b);
+impl From<std::io::Error> for Error {
+    fn from(value: std::io::Error) -> Self {
+        Self::LoadError(format!("{value:?}"))
+    }
+}
 
-        cr.deserialize()
-            .map(|e| e.map_err(|e| Error::FormatError(e.to_string())))
-            .collect()
+impl PromptLoader {
+    async fn parse_bytes(b: Vec<u8>) -> Vec<Result<Prompt>> {
+        let result = tokio::task::spawn_blocking(move || {
+            let mut cr = csv::Reader::from_reader(&b as &[u8]);
+            cr.deserialize()
+                .map(|e| e.map_err(|e| Error::FormatError(e.to_string())))
+                .collect()
+        })
+        .await
+        .unwrap_or_default();
+        result
+    }
+
+    async fn load_file(p: &str) -> Result<Vec<u8>> {
+        let mut file = File::open(p).await?;
+        let mut contents = vec![];
+        file.read_to_end(&mut contents).await?;
+        Ok(contents)
     }
 
     async fn parse_source(source: &Source<'_>) -> Vec<Result<Prompt>> {
         match source {
             Source::Http(u) => match Self::send(u).await {
-                Ok(b) => Self::parse_bytes(&b),
+                Ok(b) => Self::parse_bytes(b.into()).await,
                 Err(e) => vec![Err(e)],
             },
-            Source::File(_) => todo!(),
-            Source::Raw(b) => Self::parse_bytes(b),
+            Source::File(p) => match Self::load_file(p).await {
+                Ok(b) => Self::parse_bytes(b).await,
+                Err(e) => {
+                    vec![Err(e)]
+                }
+            },
+            Source::Raw(b) => Self::parse_bytes(b.into_iter().map(|b| *b).collect()).await,
         }
     }
 
